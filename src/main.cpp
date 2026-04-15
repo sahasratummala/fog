@@ -6,47 +6,64 @@
 
 Adafruit_MPU6050 mpu;
 Adafruit_DRV2605 drv_left;  // 0x5A (default)
-Adafruit_DRV2605 drv_right; // 0x5B (after ADDR pad soldered)
+Adafruit_DRV2605 drv_right; // 0x5B (ADDR pad soldered)
 
 // ---- FOG Detection Parameters ----
-#define STEP_THRESHOLD 12.0  // m/s^2 - heel strike detection
-#define FOG_CADENCE_DROP 0.5 // if cadence drops below 50% of normal = FOG
-#define CADENCE_WINDOW 5     // number of steps to average
-#define FOG_TIMEOUT 3000     // ms - stop cueing after 3s if no FOG
+#define STEP_THRESHOLD 11.5   // m/s^2 - slightly below gravity+impact peak (~12-14 typical)
+#define FOG_CADENCE_DROP 0.65 // FOG if cadence drops below 65% of normal (more realistic than 50%)
+#define CADENCE_WINDOW 8      // more steps = more stable normal cadence baseline
+#define CALIBRATION_STEPS 8   // must complete this many steps before FOG detection begins
+#define FOG_TIMEOUT 4000      // ms - stop cueing 4s after last FOG-level step
+#define DEBOUNCE_MS 250       // ignore steps faster than 250ms (max ~240 steps/min)
+#define MIN_WALKING_STEPS 3   // need at least 3 steps before computing cadence at all
 
 // ---- State ----
 unsigned long stepTimes[CADENCE_WINDOW];
 int stepIndex = 0;
 int stepCount = 0;
 float normalCadence = 0;
+bool calibrated = false;
 bool fogActive = false;
 unsigned long lastFOGTime = 0;
 unsigned long lastCueTime = 0;
 bool cueLeft = true;
-float cueInterval = 500; // ms between alternating cues
+float cueInterval = 500;
 
-void buzzMotor(Adafruit_DRV2605 &drv, uint8_t effect)
+// ---- DRV2605 at custom I2C address ----
+void writeDRV(uint8_t addr, uint8_t reg, uint8_t val)
 {
-  drv.setWaveform(0, effect);
-  drv.setWaveform(1, 0);
-  drv.go();
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
 }
 
-bool detectHeelStrike(float accelY)
+void buzzMotorDirect(uint8_t addr, uint8_t effect)
 {
-  static float lastAccelY = 0;
-  static bool wasHigh = false;
+  writeDRV(addr, 0x04, effect);
+  writeDRV(addr, 0x05, 0);
+  writeDRV(addr, 0x0C, 1);
+}
+
+void buzzLeft(uint8_t effect) { buzzMotorDirect(0x5A, effect); }
+void buzzRight(uint8_t effect) { buzzMotorDirect(0x5B, effect); }
+
+// ---- Step Detection ----
+bool detectHeelStrike(float accelMag)
+{
+  static float lastAccelMag = 0;
   static unsigned long lastStepTime = 0;
 
-  // Debounce - ignore steps faster than 200ms apart
-  if (millis() - lastStepTime < 200)
+  if (millis() - lastStepTime < DEBOUNCE_MS)
+  {
+    lastAccelMag = accelMag;
     return false;
+  }
 
-  bool isHigh = accelY > STEP_THRESHOLD;
-  bool strikeDetected = isHigh && !wasHigh;
-  wasHigh = isHigh;
+  bool crossedUp = (accelMag > STEP_THRESHOLD && lastAccelMag <= STEP_THRESHOLD);
+  lastAccelMag = accelMag;
 
-  if (strikeDetected)
+  if (crossedUp)
   {
     lastStepTime = millis();
     return true;
@@ -54,71 +71,88 @@ bool detectHeelStrike(float accelY)
   return false;
 }
 
+// ---- Cadence (steps per minute) ----
 float computeCadence()
 {
-  if (stepCount < 2)
-    return 0;
   int samples = min(stepCount, CADENCE_WINDOW);
+  if (samples < 2)
+    return 0;
 
-  // Average time between last N steps
   float totalTime = 0;
-  for (int i = 1; i < samples; i++)
+  int counted = 0;
+  for (int i = 0; i < samples - 1; i++)
   {
-    int curr = (stepIndex - i + CADENCE_WINDOW) % CADENCE_WINDOW;
-    int prev = (stepIndex - i - 1 + CADENCE_WINDOW) % CADENCE_WINDOW;
-    totalTime += stepTimes[curr] - stepTimes[prev];
+    int curr = (stepIndex - 1 - i + CADENCE_WINDOW) % CADENCE_WINDOW;
+    int prev = (stepIndex - 2 - i + CADENCE_WINDOW) % CADENCE_WINDOW;
+    long diff = (long)stepTimes[curr] - (long)stepTimes[prev];
+    if (diff > 0 && diff < 3000)
+    {
+      totalTime += diff;
+      counted++;
+    }
   }
-  float avgInterval = totalTime / (samples - 1);
-  return (avgInterval > 0) ? (60000.0 / avgInterval) : 0; // steps per minute
+  if (counted == 0)
+    return 0;
+  return 60000.0 / (totalTime / counted);
+}
+
+// ---- Init DRV2605 at a given I2C address ----
+bool initDRV(uint8_t addr)
+{
+  Wire.beginTransmission(addr);
+  if (Wire.endTransmission() != 0)
+    return false;
+  writeDRV(addr, 0x01, 0x00);
+  writeDRV(addr, 0x03, 0x01);
+  writeDRV(addr, 0x16, 0x00);
+  return true;
 }
 
 void setup()
 {
   Serial.begin(115200);
   Wire.begin(21, 22);
+  delay(100);
 
   // ---- IMU ----
   if (!mpu.begin())
   {
-    Serial.println("❌ IMU FAILED");
+    Serial.println("❌ IMU FAILED - check SDA/SCL wiring");
     while (1)
       delay(10);
   }
-  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   Serial.println("✅ IMU ready");
 
   // ---- LEFT MOTOR (0x5A) ----
   if (!drv_left.begin())
   {
-    Serial.println("❌ LEFT driver FAILED");
+    Serial.println("❌ LEFT haptic driver FAILED");
     while (1)
       delay(10);
   }
   drv_left.selectLibrary(1);
   drv_left.setMode(DRV2605_MODE_INTTRIG);
-  Serial.println("✅ LEFT driver ready");
+  Serial.println("✅ LEFT driver ready at 0x5A");
 
   // ---- RIGHT MOTOR (0x5B) ----
-  TwoWire *wire2 = &Wire;
-  wire2->beginTransmission(0x5B);
-  if (wire2->endTransmission() != 0)
+  if (!initDRV(0x5B))
   {
-    Serial.println("❌ RIGHT driver FAILED - check ADDR solder pad");
+    Serial.println("❌ RIGHT haptic driver FAILED - check ADDR solder pad");
     while (1)
       delay(10);
   }
-  drv_right.begin();
-  drv_right.selectLibrary(1);
-  drv_right.setMode(DRV2605_MODE_INTTRIG);
-  Serial.println("✅ RIGHT driver ready");
+  Serial.println("✅ RIGHT driver ready at 0x5B");
 
-  // ---- Quick motor test ----
+  // ---- Motor test ----
   Serial.println("Testing motors...");
-  buzzMotor(drv_left, 47);
+  buzzLeft(47);
   delay(600);
-  buzzMotor(drv_right, 47);
+  buzzRight(47);
   delay(600);
-  Serial.println("✅ Motors tested - starting FOG detection");
+  Serial.println("✅ Both motors tested");
+  Serial.println("--- Walk normally for 8 steps to calibrate ---");
 }
 
 void loop()
@@ -140,21 +174,30 @@ void loop()
 
     float cadence = computeCadence();
 
-    // Calibrate normal cadence from first 5 steps
-    if (stepCount == CADENCE_WINDOW)
+    // ---- Calibration ----
+    if (!calibrated && stepCount >= CALIBRATION_STEPS)
     {
       normalCadence = cadence;
-      Serial.print("✅ Normal cadence calibrated: ");
-      Serial.print(normalCadence);
-      Serial.println(" steps/min");
+      calibrated = true;
+      Serial.print("✅ Calibrated. Normal cadence: ");
+      Serial.print(normalCadence, 1);
+      Serial.println(" steps/min — FOG detection active");
     }
 
-    Serial.print("Step detected | Cadence: ");
-    Serial.print(cadence);
-    Serial.println(" steps/min");
+    if (stepCount >= MIN_WALKING_STEPS)
+    {
+      Serial.print("Step #");
+      Serial.print(stepCount);
+      Serial.print(" | Cadence: ");
+      Serial.print(cadence, 1);
+      Serial.print(" steps/min");
+      if (!calibrated)
+        Serial.print(" (calibrating...)");
+      Serial.println();
+    }
 
     // ---- FOG Detection ----
-    if (normalCadence > 0 && stepCount > CADENCE_WINDOW)
+    if (calibrated && cadence > 0)
     {
       if (cadence < normalCadence * FOG_CADENCE_DROP)
       {
@@ -164,31 +207,30 @@ void loop()
         }
         fogActive = true;
         lastFOGTime = millis();
-        // Set cue interval based on normal cadence
         cueInterval = (60000.0 / normalCadence) / 2.0;
       }
     }
   }
 
-  // ---- Stop FOG if walking resumes ----
-  if (fogActive && millis() - lastFOGTime > FOG_TIMEOUT)
+  // ---- Stop cueing if walking resumes ----
+  if (fogActive && (millis() - lastFOGTime > FOG_TIMEOUT))
   {
     fogActive = false;
     Serial.println("✅ FOG resolved - stopping cues");
   }
 
-  // ---- Alternating L/R Vibration Cues ----
-  if (fogActive && millis() - lastCueTime > cueInterval)
+  // ---- Alternating L/R Cues ----
+  if (fogActive && (millis() - lastCueTime > cueInterval))
   {
     lastCueTime = millis();
     if (cueLeft)
     {
-      buzzMotor(drv_left, 47);
+      buzzLeft(47);
       Serial.println("← LEFT cue");
     }
     else
     {
-      buzzMotor(drv_right, 47);
+      buzzRight(47);
       Serial.println("→ RIGHT cue");
     }
     cueLeft = !cueLeft;
