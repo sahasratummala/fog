@@ -5,8 +5,8 @@
 #include <Wire.h>
 
 Adafruit_MPU6050 mpu;
-Adafruit_DRV2605 drv_left;  // 0x5A (default)
-Adafruit_DRV2605 drv_right; // 0x5B (ADDR pad soldered)
+Adafruit_DRV2605 drv_left;   // 0x5A on Wire  (SDA=21, SCL=22)
+Adafruit_DRV2605 drv_right;  // 0x5A on Wire1 (SDA=18, SCL=19)
 
 // ---- FOG Detection Parameters ----
 #define STEP_THRESHOLD 11.5   // m/s^2 - slightly below gravity+impact peak (~12-14 typical)
@@ -29,24 +29,24 @@ unsigned long lastCueTime = 0;
 bool cueLeft = true;
 float cueInterval = 500;
 
-// ---- DRV2605 at custom I2C address ----
-void writeDRV(uint8_t addr, uint8_t reg, uint8_t val)
+// ---- DRV2605 register write (bus-aware) ----
+void writeDRV(TwoWire &bus, uint8_t reg, uint8_t val)
 {
-  Wire.beginTransmission(addr);
-  Wire.write(reg);
-  Wire.write(val);
-  Wire.endTransmission();
+  bus.beginTransmission(0x5A);
+  bus.write(reg);
+  bus.write(val);
+  bus.endTransmission();
 }
 
-void buzzMotorDirect(uint8_t addr, uint8_t effect)
+void buzzMotorDirect(TwoWire &bus, uint8_t effect)
 {
-  writeDRV(addr, 0x04, effect);
-  writeDRV(addr, 0x05, 0);
-  writeDRV(addr, 0x0C, 1);
+  writeDRV(bus, 0x04, effect);
+  writeDRV(bus, 0x05, 0);
+  writeDRV(bus, 0x0C, 1);
 }
 
-void buzzLeft(uint8_t effect) { buzzMotorDirect(0x5A, effect); }
-void buzzRight(uint8_t effect) { buzzMotorDirect(0x5B, effect); }
+void buzzLeft(uint8_t effect)  { buzzMotorDirect(Wire,  effect); }
+void buzzRight(uint8_t effect) { buzzMotorDirect(Wire1, effect); }
 
 // ---- Step Detection ----
 bool detectHeelStrike(float accelMag)
@@ -96,15 +96,15 @@ float computeCadence()
   return 60000.0 / (totalTime / counted);
 }
 
-// ---- Init DRV2605 at a given I2C address ----
-bool initDRV(uint8_t addr)
+// ---- Init DRV2605 on a given I2C bus ----
+bool initDRV(TwoWire &bus)
 {
-  Wire.beginTransmission(addr);
-  if (Wire.endTransmission() != 0)
+  bus.beginTransmission(0x5A);
+  if (bus.endTransmission() != 0)
     return false;
-  writeDRV(addr, 0x01, 0x00);
-  writeDRV(addr, 0x03, 0x01);
-  writeDRV(addr, 0x16, 0x00);
+  writeDRV(bus, 0x01, 0x00);
+  writeDRV(bus, 0x03, 0x01);
+  writeDRV(bus, 0x16, 0x00);
   return true;
 }
 
@@ -136,14 +136,17 @@ void setup()
   drv_left.setMode(DRV2605_MODE_INTTRIG);
   Serial.println("✅ LEFT driver ready at 0x5A");
 
-  // ---- RIGHT MOTOR (0x5B) ----
-  if (!initDRV(0x5B))
+  // ---- RIGHT MOTOR (Wire1: SDA=18, SCL=19) ----
+  Wire1.begin(18, 19);
+  if (!drv_right.begin(&Wire1))
   {
-    Serial.println("❌ RIGHT haptic driver FAILED - check ADDR solder pad");
+    Serial.println("❌ RIGHT haptic driver FAILED - check SDA/SCL on GPIO 18/19");
     while (1)
       delay(10);
   }
-  Serial.println("✅ RIGHT driver ready at 0x5B");
+  drv_right.selectLibrary(1);
+  drv_right.setMode(DRV2605_MODE_INTTRIG);
+  Serial.println("✅ RIGHT driver ready on Wire1 (GPIO 18/19)");
 
   // ---- Motor test ----
   Serial.println("Testing motors...");
