@@ -10,7 +10,7 @@ Adafruit_DRV2605 drv_right;  // 0x5A on Wire1 (SDA=18, SCL=19)
 
 // ---- FOG Detection Parameters ----
 #define STEP_THRESHOLD 11.5   // m/s^2 - slightly below gravity+impact peak (~12-14 typical)
-#define FOG_CADENCE_DROP 0.65 // FOG if cadence drops below 65% of normal (more realistic than 50%)
+#define FOG_CADENCE_DROP 0.50 // FOG if cadence drops below 50% of normal
 #define CADENCE_WINDOW 8      // more steps = more stable normal cadence baseline
 #define CALIBRATION_STEPS 8   // must complete this many steps before FOG detection begins
 #define FOG_TIMEOUT 4000      // ms - stop cueing 4s after last FOG-level step
@@ -28,25 +28,23 @@ unsigned long lastFOGTime = 0;
 unsigned long lastCueTime = 0;
 bool cueLeft = true;
 float cueInterval = 500;
+unsigned long lastStepDetectedTime = 0;  // tracks when last step was seen
+#define NO_STEP_FOG_MS 2000              // trigger FOG if no step for this long
 
-// ---- DRV2605 register write (bus-aware) ----
-void writeDRV(TwoWire &bus, uint8_t reg, uint8_t val)
+void buzzLeft(uint8_t effect)
 {
-  bus.beginTransmission(0x5A);
-  bus.write(reg);
-  bus.write(val);
-  bus.endTransmission();
+  drv_left.setWaveform(0, effect);
+  drv_left.setWaveform(1, 0);
+  drv_left.go();
+  delay(5); // let Wire bus settle before IMU reads it again
 }
 
-void buzzMotorDirect(TwoWire &bus, uint8_t effect)
+void buzzRight(uint8_t effect)
 {
-  writeDRV(bus, 0x04, effect);
-  writeDRV(bus, 0x05, 0);
-  writeDRV(bus, 0x0C, 1);
+  drv_right.setWaveform(0, effect);
+  drv_right.setWaveform(1, 0);
+  drv_right.go();
 }
-
-void buzzLeft(uint8_t effect)  { buzzMotorDirect(Wire,  effect); }
-void buzzRight(uint8_t effect) { buzzMotorDirect(Wire1, effect); }
 
 // ---- Step Detection ----
 bool detectHeelStrike(float accelMag)
@@ -96,17 +94,6 @@ float computeCadence()
   return 60000.0 / (totalTime / counted);
 }
 
-// ---- Init DRV2605 on a given I2C bus ----
-bool initDRV(TwoWire &bus)
-{
-  bus.beginTransmission(0x5A);
-  if (bus.endTransmission() != 0)
-    return false;
-  writeDRV(bus, 0x01, 0x00);
-  writeDRV(bus, 0x03, 0x01);
-  writeDRV(bus, 0x16, 0x00);
-  return true;
-}
 
 void setup()
 {
@@ -150,9 +137,9 @@ void setup()
 
   // ---- Motor test ----
   Serial.println("Testing motors...");
-  buzzLeft(47);
+  buzzLeft(53);
   delay(600);
-  buzzRight(47);
+  buzzRight(53);
   delay(600);
   Serial.println("✅ Both motors tested");
   Serial.println("--- Walk normally for 8 steps to calibrate ---");
@@ -171,6 +158,7 @@ void loop()
   // ---- Step Detection ----
   if (detectHeelStrike(accelMag))
   {
+    lastStepDetectedTime = millis();
     stepTimes[stepIndex] = millis();
     stepIndex = (stepIndex + 1) % CADENCE_WINDOW;
     stepCount++;
@@ -202,6 +190,12 @@ void loop()
     // ---- FOG Detection ----
     if (calibrated && cadence > 0)
     {
+      // Keep normalCadence updated during normal walking
+      if (!fogActive && cadence > normalCadence * FOG_CADENCE_DROP)
+      {
+        normalCadence = normalCadence * 0.85 + cadence * 0.15;
+      }
+
       if (cadence < normalCadence * FOG_CADENCE_DROP)
       {
         if (!fogActive)
@@ -215,7 +209,34 @@ void loop()
     }
   }
 
-  // ---- Stop cueing if walking resumes ----
+  // ---- While FOG is active and person is still stopped, keep refreshing
+  //      lastFOGTime so the 4s timeout doesn't cycle ----
+  if (fogActive && lastStepDetectedTime > 0 &&
+      (millis() - lastStepDetectedTime > NO_STEP_FOG_MS))
+  {
+    lastFOGTime = millis();
+  }
+
+  // ---- Hard stop: no steps for 10 seconds - halt cueing entirely ----
+  if (fogActive && lastStepDetectedTime > 0 &&
+      (millis() - lastStepDetectedTime > 10000))
+  {
+    fogActive = false;
+    Serial.println("⏹ Stopped 10s - cueing halted");
+  }
+
+  // ---- Trigger FOG if no step detected for too long ----
+  if (calibrated && !fogActive && lastStepDetectedTime > 0 &&
+      (millis() - lastStepDetectedTime > NO_STEP_FOG_MS) &&
+      (millis() - lastStepDetectedTime < 10000))
+  {
+    fogActive = true;
+    lastFOGTime = millis();
+    cueInterval = (60000.0 / normalCadence) / 2.0;
+    Serial.println("🚨 FOG DETECTED (no steps) - starting vibration cues");
+  }
+
+  // ---- Stop cueing if cadence-based FOG has resolved (walking resumed) ----
   if (fogActive && (millis() - lastFOGTime > FOG_TIMEOUT))
   {
     fogActive = false;
@@ -228,12 +249,12 @@ void loop()
     lastCueTime = millis();
     if (cueLeft)
     {
-      buzzLeft(47);
+      buzzLeft(53);
       Serial.println("← LEFT cue");
     }
     else
     {
-      buzzRight(47);
+      buzzRight(53);
       Serial.println("→ RIGHT cue");
     }
     cueLeft = !cueLeft;
